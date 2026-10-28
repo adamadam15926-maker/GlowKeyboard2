@@ -1,0 +1,696 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Create project files
+        run: |
+          mkdir -p GlowKeyboard/app
+          cat > GlowKeyboard/app/build.gradle.kts <<'GLOW_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.menhl.glowkeyboard"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.menhl.glowkeyboard"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main
+          cat > GlowKeyboard/app/src/main/AndroidManifest.xml <<'GLOW_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+
+                  <service
+                      android:name=".KeyboardService"
+                      android:label="@string/app_name"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_INPUT_METHOD">
+                      <intent-filter>
+                          <action android:name="android.view.InputMethod" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.view.im"
+                          android:resource="@xml/method" />
+                  </service>
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard
+          cat > GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard/DeepL.kt <<'GLOW_EOF'
+          package com.menhl.glowkeyboard
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object DeepL {
+              fun translate(key: String, text: String, target: String): String {
+                  val host = if (key.endsWith(":fx")) "api-free.deepl.com" else "api.deepl.com"
+                  val conn = URL("https://$host/v2/translate").openConnection() as HttpURLConnection
+                  conn.requestMethod = "POST"
+                  conn.connectTimeout = 10000
+                  conn.readTimeout = 15000
+                  conn.doOutput = true
+                  conn.setRequestProperty("Authorization", "DeepL-Auth-Key $key")
+                  conn.setRequestProperty("Content-Type", "application/json")
+
+                  val body = JSONObject()
+                      .put("text", JSONArray().put(text))
+                      .put("target_lang", target)
+                      .toString()
+                  conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+                  val code = conn.responseCode
+                  val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                  val resp = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                  conn.disconnect()
+
+                  if (code !in 200..299) {
+                      throw Exception(
+                          when (code) {
+                              403 -> "مفتاح DeepL غير صحيح"
+                              456 -> "انتهى رصيد الترجمة"
+                              else -> "خطأ $code"
+                          }
+                      )
+                  }
+                  return JSONObject(resp)
+                      .getJSONArray("translations")
+                      .getJSONObject(0)
+                      .getString("text")
+              }
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard
+          cat > GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard/GlowKeyboardView.kt <<'GLOW_EOF'
+          package com.menhl.glowkeyboard
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.RectF
+          import android.graphics.Typeface
+          import android.view.HapticFeedbackConstants
+          import android.view.MotionEvent
+          import android.view.View
+
+          class GlowKeyboardView(context: Context) : View(context) {
+
+              interface Listener {
+                  fun onKey(text: String)
+                  fun onSpecial(id: String)
+              }
+
+              var listener: Listener? = null
+
+              private class Key(val label: String, val id: String?, val weight: Float) {
+                  val rect = RectF()
+              }
+
+              private var rows: List<List<Key>> = emptyList()
+              private var hueShift = 0f
+              private var micActive = false
+              private val pressed = mutableSetOf<Key>()
+
+              private val keyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+              private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  style = Paint.Style.STROKE
+                  strokeWidth = dp(1.5f)
+              }
+              private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  textAlign = Paint.Align.CENTER
+                  typeface = Typeface.DEFAULT_BOLD
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      hueShift = (hueShift + 3f) % 360f
+                      invalidate()
+                      postDelayed(this, 50)
+                  }
+              }
+
+              private val repeatDel = object : Runnable {
+                  override fun run() {
+                      listener?.onSpecial("DEL")
+                      postDelayed(this, 70)
+                  }
+              }
+
+              init {
+                  setLayerType(LAYER_TYPE_SOFTWARE, null)
+              }
+
+              private fun dp(v: Float) = v * resources.displayMetrics.density
+
+              fun setMicActive(active: Boolean) {
+                  micActive = active
+                  invalidate()
+              }
+
+              fun setLayout(arabic: Boolean) {
+                  fun chars(s: String) = s.map { Key(it.toString(), null, 1f) }
+
+                  val nums = chars("1234567890")
+                  val l1 = chars(if (arabic) "ضصثقفغعهخحج" else "qwertyuiop")
+                  val l2 = chars(if (arabic) "شسيبلاتنمكط" else "asdfghjkl")
+                  val l3 = chars(if (arabic) "ئءؤرىةوزظدذأ" else "zxcvbnm")
+                  val bottom = listOf(
+                      Key(if (arabic) "EN" else "ع", "LANG", 1.3f),
+                      Key("🎤", "MIC", 1.3f),
+                      Key(if (arabic) "،" else ",", null, 1f),
+                      Key(if (arabic) "العربية" else "English", "SPACE", 3.5f),
+                      Key(".", null, 1f),
+                      Key(if (arabic) "ترجمة" else "Translate", "TRANS", 1.9f),
+                      Key("⌫", "DEL", 1.3f),
+                      Key("↵", "ENTER", 1.3f)
+                  )
+                  rows = listOf(nums, l1, l2, l3, bottom)
+                  layoutKeys()
+                  invalidate()
+              }
+
+              override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                  val w = MeasureSpec.getSize(widthMeasureSpec)
+                  val h = (dp(54f) * 5 + dp(8f)).toInt()
+                  setMeasuredDimension(w, h)
+              }
+
+              override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+                  super.onSizeChanged(w, h, oldw, oldh)
+                  layoutKeys()
+              }
+
+              private fun layoutKeys() {
+                  if (width == 0 || rows.isEmpty()) return
+                  val gap = dp(4f)
+                  val pad = dp(4f)
+                  val rowH = (height - pad * 2) / rows.size
+                  rows.forEachIndexed { r, row ->
+                      val totalW = row.sumOf { it.weight.toDouble() }.toFloat()
+                      val usable = width - pad * 2 - gap * (row.size - 1)
+                      var x = pad
+                      for (k in row) {
+                          val w = usable * k.weight / totalW
+                          k.rect.set(x, pad + r * rowH + gap / 2, x + w, pad + (r + 1) * rowH - gap / 2)
+                          x += w + gap
+                      }
+                  }
+              }
+
+              override fun onDraw(c: Canvas) {
+                  c.drawColor(0xFF0A0A14.toInt())
+                  val radius = dp(10f)
+                  var idx = 0
+                  for (row in rows) {
+                      for (k in row) {
+                          var color = Color.HSVToColor(floatArrayOf((hueShift + idx * 13f) % 360f, 0.85f, 1f))
+                          if (k.id == "MIC" && micActive) color = Color.RED
+                          val isPressed = pressed.contains(k)
+
+                          keyPaint.color = if (isPressed) (color and 0x00FFFFFF) or 0x55000000 else 0xFF14141F.toInt()
+                          c.drawRoundRect(k.rect, radius, radius, keyPaint)
+
+                          strokePaint.color = (color and 0x00FFFFFF) or 0x88000000.toInt()
+                          strokePaint.setShadowLayer(dp(5f), 0f, 0f, color)
+                          c.drawRoundRect(k.rect, radius, radius, strokePaint)
+
+                          val big = k.id == null || k.id == "DEL" || k.id == "ENTER" || k.id == "MIC"
+                          textPaint.textSize = dp(if (big) 20f else 13f)
+                          textPaint.color = color
+                          textPaint.setShadowLayer(dp(8f), 0f, 0f, color)
+                          val fm = textPaint.fontMetrics
+                          val y = k.rect.centerY() - (fm.ascent + fm.descent) / 2f
+                          c.drawText(k.label, k.rect.centerX(), y, textPaint)
+                          idx++
+                      }
+                  }
+              }
+
+              private fun hit(x: Float, y: Float): Key? {
+                  val g = dp(3f)
+                  for (row in rows) for (k in row) {
+                      val r = k.rect
+                      if (x >= r.left - g && x <= r.right + g && y >= r.top - g && y <= r.bottom + g) return k
+                  }
+                  return null
+              }
+
+              private fun fire(k: Key) {
+                  val id = k.id
+                  if (id == null) listener?.onKey(k.label) else listener?.onSpecial(id)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                          val i = e.actionIndex
+                          val k = hit(e.getX(i), e.getY(i))
+                          if (k != null) {
+                              pressed.add(k)
+                              performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                              fire(k)
+                              if (k.id == "DEL") {
+                                  removeCallbacks(repeatDel)
+                                  postDelayed(repeatDel, 400)
+                              }
+                          }
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_POINTER_UP -> {
+                          val i = e.actionIndex
+                          val k = hit(e.getX(i), e.getY(i))
+                          if (k != null) {
+                              pressed.remove(k)
+                              if (k.id == "DEL") removeCallbacks(repeatDel)
+                          }
+                          invalidate()
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                          pressed.clear()
+                          removeCallbacks(repeatDel)
+                          invalidate()
+                      }
+                  }
+                  return true
+              }
+
+              override fun onAttachedToWindow() {
+                  super.onAttachedToWindow()
+                  removeCallbacks(tick)
+                  post(tick)
+              }
+
+              override fun onDetachedFromWindow() {
+                  removeCallbacks(tick)
+                  removeCallbacks(repeatDel)
+                  super.onDetachedFromWindow()
+              }
+
+              override fun onWindowVisibilityChanged(visibility: Int) {
+                  super.onWindowVisibilityChanged(visibility)
+                  removeCallbacks(tick)
+                  if (visibility == VISIBLE) post(tick)
+              }
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard
+          cat > GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard/KeyboardService.kt <<'GLOW_EOF'
+          package com.menhl.glowkeyboard
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.inputmethodservice.InputMethodService
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.inputmethod.EditorInfo
+          import android.widget.Toast
+
+          class KeyboardService : InputMethodService(), GlowKeyboardView.Listener {
+
+              private var isArabic = true
+              private var keyboardView: GlowKeyboardView? = null
+              private var recognizer: SpeechRecognizer? = null
+              private var listening = false
+              private val main = Handler(Looper.getMainLooper())
+
+              override fun onCreateInputView(): View {
+                  val v = GlowKeyboardView(this)
+                  v.listener = this
+                  v.setLayout(isArabic)
+                  keyboardView = v
+                  return v
+              }
+
+              override fun onKey(text: String) {
+                  currentInputConnection?.commitText(text, 1)
+              }
+
+              override fun onSpecial(id: String) {
+                  when (id) {
+                      "LANG" -> {
+                          isArabic = !isArabic
+                          keyboardView?.setLayout(isArabic)
+                      }
+                      "MIC" -> toggleMic()
+                      "SPACE" -> currentInputConnection?.commitText(" ", 1)
+                      "DEL" -> sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+                      "ENTER" -> pressEnter()
+                      "TRANS" -> translate()
+                  }
+              }
+
+              private fun pressEnter() {
+                  val ei = currentInputEditorInfo
+                  val action = ei?.imeOptions?.and(EditorInfo.IME_MASK_ACTION) ?: EditorInfo.IME_ACTION_NONE
+                  val noEnterAction = ei != null && (ei.imeOptions and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+                  if (ei != null && !noEnterAction &&
+                      action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED
+                  ) {
+                      currentInputConnection?.performEditorAction(action)
+                  } else {
+                      sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+                  }
+              }
+
+              // ---------- الترجمة عبر DeepL ----------
+              private fun translate() {
+                  val ic = currentInputConnection ?: return
+                  val selected = ic.getSelectedText(0)?.toString()
+                  val hasSelection = !selected.isNullOrEmpty()
+                  val before = if (hasSelection) "" else (ic.getTextBeforeCursor(5000, 0)?.toString() ?: "")
+                  val after = if (hasSelection) "" else (ic.getTextAfterCursor(5000, 0)?.toString() ?: "")
+                  val text = if (hasSelection) selected!! else before + after
+
+                  if (text.isBlank()) {
+                      toast("اكتب نصاً أولاً")
+                      return
+                  }
+                  val key = getSharedPreferences("glow", MODE_PRIVATE)
+                      .getString("deepl_key", "")?.trim().orEmpty()
+                  if (key.isEmpty()) {
+                      toast("أضف مفتاح DeepL من تطبيق الكيبورد")
+                      return
+                  }
+                  val target = if (isArabic) "EN-US" else "AR"
+                  toast("جاري الترجمة...")
+
+                  Thread {
+                      try {
+                          val result = DeepL.translate(key, text, target)
+                          main.post {
+                              val c = currentInputConnection
+                              if (c != null) {
+                                  if (!hasSelection) c.deleteSurroundingText(before.length, after.length)
+                                  c.commitText(result, 1)
+                              }
+                          }
+                      } catch (e: Exception) {
+                          main.post { toast("تعذرت الترجمة: ${e.message}") }
+                      }
+                  }.start()
+              }
+
+              // ---------- الميكروفون ----------
+              private val recognitionListener = object : RecognitionListener {
+                  override fun onReadyForSpeech(params: Bundle?) {}
+                  override fun onBeginningOfSpeech() {}
+                  override fun onRmsChanged(rmsdB: Float) {}
+                  override fun onBufferReceived(buffer: ByteArray?) {}
+                  override fun onEndOfSpeech() {}
+                  override fun onError(error: Int) {
+                      micStopped()
+                      if (error != SpeechRecognizer.ERROR_NO_MATCH &&
+                          error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                      ) toast("خطأ في الميكروفون ($error)")
+                  }
+                  override fun onResults(results: Bundle?) {
+                      micStopped()
+                      val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                      if (!t.isNullOrEmpty()) currentInputConnection?.commitText(t, 1)
+                  }
+                  override fun onPartialResults(partialResults: Bundle?) {}
+                  override fun onEvent(eventType: Int, params: Bundle?) {}
+              }
+
+              private fun micStopped() {
+                  listening = false
+                  keyboardView?.setMicActive(false)
+              }
+
+              private fun toggleMic() {
+                  if (listening) {
+                      recognizer?.stopListening()
+                      return
+                  }
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      toast("اسمح بالميكروفون ثم ارجع")
+                      startActivity(
+                          Intent(this, MainActivity::class.java)
+                              .putExtra("ask_mic", true)
+                              .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      )
+                      return
+                  }
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      toast("خدمة التعرف على الصوت غير متوفرة")
+                      return
+                  }
+                  if (recognizer == null) {
+                      recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                          setRecognitionListener(recognitionListener)
+                      }
+                  }
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (isArabic) "ar-IQ" else "en-US")
+                  }
+                  listening = true
+                  keyboardView?.setMicActive(true)
+                  recognizer?.startListening(intent)
+              }
+
+              override fun onFinishInputView(finishingInput: Boolean) {
+                  super.onFinishInputView(finishingInput)
+                  recognizer?.cancel()
+                  micStopped()
+              }
+
+              override fun onDestroy() {
+                  recognizer?.destroy()
+                  recognizer = null
+                  super.onDestroy()
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard
+          cat > GlowKeyboard/app/src/main/java/com/menhl/glowkeyboard/MainActivity.kt <<'GLOW_EOF'
+          package com.menhl.glowkeyboard
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.decorView.layoutDirection = View.LAYOUT_DIRECTION_RTL
+
+                  val d = resources.displayMetrics.density
+                  fun px(v: Int) = (v * d).toInt()
+                  val prefs = getSharedPreferences("glow", MODE_PRIVATE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(20), px(24), px(20), px(24))
+                  }
+
+                  fun label(t: String) = TextView(this).apply {
+                      text = t
+                      textSize = 16f
+                      setPadding(0, px(12), 0, px(4))
+                  }
+
+                  fun button(t: String, onClick: () -> Unit) = Button(this).apply {
+                      text = t
+                      setOnClickListener { onClick() }
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "كيبورد مضيء"
+                      textSize = 26f
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, px(12))
+                  })
+
+                  root.addView(button("1) تفعيل الكيبورد") {
+                      startActivity(Intent(Settings.ACTION_INPUT_METHOD_SETTINGS))
+                  })
+                  root.addView(button("2) اختيار الكيبورد") {
+                      (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showInputMethodPicker()
+                  })
+                  root.addView(button("3) السماح بالميكروفون") {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  })
+
+                  root.addView(label("مفتاح DeepL API (المجاني ينتهي بـ :fx)"))
+                  val keyBox = EditText(this).apply {
+                      hint = "الصق المفتاح هنا"
+                      setText(prefs.getString("deepl_key", ""))
+                      setSingleLine()
+                  }
+                  root.addView(keyBox)
+                  root.addView(button("حفظ المفتاح") {
+                      prefs.edit().putString("deepl_key", keyBox.text.toString().trim()).apply()
+                      Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show()
+                  })
+
+                  root.addView(label("جرّب الكيبورد هنا"))
+                  root.addView(EditText(this).apply { hint = "اكتب هنا..." })
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  if (intent.getBooleanExtra("ask_mic", false)) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+                  }
+              }
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/res/values
+          cat > GlowKeyboard/app/src/main/res/values/strings.xml <<'GLOW_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">كيبورد مضيء</string>
+          </resources>
+          GLOW_EOF
+          mkdir -p GlowKeyboard/app/src/main/res/xml
+          cat > GlowKeyboard/app/src/main/res/xml/method.xml <<'GLOW_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <input-method xmlns:android="http://schemas.android.com/apk/res/android"
+              android:settingsActivity="com.menhl.glowkeyboard.MainActivity" />
+          GLOW_EOF
+          mkdir -p GlowKeyboard
+          cat > GlowKeyboard/build.gradle.kts <<'GLOW_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          GLOW_EOF
+          mkdir -p GlowKeyboard
+          cat > GlowKeyboard/gradle.properties <<'GLOW_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          GLOW_EOF
+          mkdir -p GlowKeyboard/gradle/wrapper
+          cat > GlowKeyboard/gradle/wrapper/gradle-wrapper.properties <<'GLOW_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          GLOW_EOF
+          mkdir -p GlowKeyboard
+          cat > GlowKeyboard/settings.gradle.kts <<'GLOW_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GlowKeyboard"
+          include(":app")
+          GLOW_EOF
+
+      - name: Build APK
+        working-directory: GlowKeyboard
+        run: gradle assembleDebug --no-daemon
+
+      - name: Save APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GlowKeyboard-APK
+          path: GlowKeyboard/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK as release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Glow Keyboard ${{ github.run_number }}
+          files: GlowKeyboard/app/build/outputs/apk/debug/app-debug.apk
